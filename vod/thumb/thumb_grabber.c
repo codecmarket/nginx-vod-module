@@ -107,10 +107,8 @@ thumb_grabber_free_state(void* context)
 		av_freep(state->resize_buffer);
 	}
 	av_frame_free(&state->decoded_frame);
-	avcodec_close(state->encoder);
-	av_free(state->encoder);
-	avcodec_close(state->decoder);
-	av_free(state->decoder);
+	avcodec_free_context(&state->encoder);
+	avcodec_free_context(&state->decoder);
 }
 
 static vod_status_t
@@ -136,8 +134,19 @@ thumb_grabber_init_decoder(
 	decoder->time_base.num = 1;
 	decoder->time_base.den = media_info->frames_timescale;
 	decoder->pkt_timebase = decoder->time_base;
-	decoder->extradata = media_info->extra_data.data;
-	decoder->extradata_size = media_info->extra_data.len;
+	// extradata must be av_malloc'ed with padding, avcodec_free_context frees it
+	if (media_info->extra_data.len > 0)
+	{
+		decoder->extradata = av_mallocz(media_info->extra_data.len + AV_INPUT_BUFFER_PADDING_SIZE);
+		if (decoder->extradata == NULL)
+		{
+			vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+				"thumb_grabber_init_decoder: av_mallocz failed");
+			return VOD_ALLOC_FAILED;
+		}
+		vod_memcpy(decoder->extradata, media_info->extra_data.data, media_info->extra_data.len);
+		decoder->extradata_size = media_info->extra_data.len;
+	}
 	decoder->width = media_info->u.video.width;
 	decoder->height = media_info->u.video.height;
 

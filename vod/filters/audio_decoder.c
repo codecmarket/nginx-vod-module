@@ -53,8 +53,19 @@ audio_decoder_init_decoder(
 	decoder->time_base.num = 1;
 	decoder->time_base.den = media_info->frames_timescale;
 	decoder->pkt_timebase = decoder->time_base;
-	decoder->extradata = media_info->extra_data.data;
-	decoder->extradata_size = media_info->extra_data.len;
+	// extradata must be av_malloc'ed with padding, avcodec_free_context frees it
+	if (media_info->extra_data.len > 0)
+	{
+		decoder->extradata = av_mallocz(media_info->extra_data.len + AV_INPUT_BUFFER_PADDING_SIZE);
+		if (decoder->extradata == NULL)
+		{
+			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+				"audio_decoder_init_decoder: av_mallocz failed");
+			return VOD_ALLOC_FAILED;
+		}
+		vod_memcpy(decoder->extradata, media_info->extra_data.data, media_info->extra_data.len);
+		decoder->extradata_size = media_info->extra_data.len;
+	}
 
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 23, 100)
 	av_channel_layout_from_mask(&decoder->ch_layout, media_info->u.audio.channel_layout);
@@ -159,9 +170,7 @@ audio_decoder_init(
 void
 audio_decoder_free(audio_decoder_state_t* state)
 {
-	avcodec_close(state->decoder);
-	av_free(state->decoder);
-	state->decoder = NULL;
+	avcodec_free_context(&state->decoder);
 	av_frame_free(&state->decoded_frame);
 }
 
