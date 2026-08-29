@@ -345,6 +345,13 @@ dfxp_strip_new_lines(u_char* buf, size_t n)
 }
 
 // copied from ngx_http_xslt_sax_error
+// libxml2 >= 2.14 deprecates direct access to xmlParserCtxt::recovery
+#if LIBXML_VERSION >= 21400
+#define dfxp_ctxt_is_recovering(ctxt) ((xmlCtxtGetOptions(ctxt) & XML_PARSE_RECOVER) != 0)
+#else
+#define dfxp_ctxt_is_recovering(ctxt) ((ctxt)->recovery != 0)
+#endif
+
 static void vod_cdecl
 dfxp_xml_sax_error(void *data, const char *msg, ...)
 {
@@ -440,7 +447,7 @@ dfxp_parse(
 
 	if (xmlParseDocument(ctxt) != 0 ||
 		ctxt->myDoc == NULL ||
-		(!ctxt->wellFormed && !ctxt->recovery))
+		(!ctxt->wellFormed && !dfxp_ctxt_is_recovering(ctxt)))
 	{
 		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
 			"dfxp_parse: xml parsing failed");
