@@ -88,12 +88,11 @@
 	"        label=\"%V\"\n"													\
 	"        segmentAlignment=\"true\">\n"
 
-// TODO: value should be the number of channels ?
 #define VOD_DASH_MANIFEST_AUDIO_CHANNEL_CONFIG									\
 	"      <AudioChannelConfiguration\n"										\
 	"          schemeIdUri=\"urn:mpeg:dash:23003:3:"							\
 								"audio_channel_configuration:2011\"\n"			\
-	"          value=\"1\"/>\n"
+	"          value=\"%uD\"/>\n"
 
 #define VOD_DASH_MANIFEST_AUDIO_CHANNEL_CONFIG_EAC3								\
 	"      <AudioChannelConfiguration\n"										\
@@ -878,8 +877,8 @@ dash_packager_write_mpd_period(
 			}
 			else
 			{
-				p = vod_copy(p, VOD_DASH_MANIFEST_AUDIO_CHANNEL_CONFIG,
-					sizeof(VOD_DASH_MANIFEST_AUDIO_CHANNEL_CONFIG) - 1);
+				p = vod_sprintf(p, VOD_DASH_MANIFEST_AUDIO_CHANNEL_CONFIG,
+					(uint32_t)reference_track->media_info.u.audio.channels);
 			}
 			break;
 
