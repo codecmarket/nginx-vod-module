@@ -28,7 +28,18 @@ audio_encoder_is_format_supported(const AVCodec *codec, enum AVSampleFormat samp
 {
 	const enum AVSampleFormat *p;
 
-	for (p = codec->sample_fmts; *p != AV_SAMPLE_FMT_NONE; p++)
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
+	// FFmpeg >= 7.1: AVCodec::sample_fmts is deprecated (removed in 8.0)
+	if (avcodec_get_supported_config(NULL, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT,
+		0, (const void**)&p, NULL) < 0 || p == NULL)
+	{
+		return FALSE;
+	}
+#else
+	p = codec->sample_fmts;
+#endif
+
+	for (; *p != AV_SAMPLE_FMT_NONE; p++)
 	{
 		if (*p == sample_fmt)
 		{
@@ -156,8 +167,7 @@ audio_encoder_free(
 		return;
 	}
 	
-	avcodec_close(state->encoder);
-	av_free(state->encoder);
+	avcodec_free_context(&state->encoder);
 }
 
 size_t
