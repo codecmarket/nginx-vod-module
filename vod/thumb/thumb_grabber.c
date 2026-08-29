@@ -4,9 +4,12 @@
 #include <libavcodec/avcodec.h>
 
 #if (VOD_HAVE_LIB_SW_SCALE)
+#include <math.h>
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #endif // VOD_HAVE_LIB_SW_SCALE
+
+#define vod_abs_diff(val1, val2) ((val2) > (val1) ? (val2) - (val1) : (val1) - (val2))
 
 // typedefs
 typedef struct
@@ -15,6 +18,8 @@ typedef struct
 	request_context_t* request_context;
 	write_callback_t write_callback;
 	void* write_context;
+	uint32_t requested_width;
+	uint32_t requested_height;
 
 	// libavcodec
 	AVCodecContext *decoder;
@@ -22,16 +27,15 @@ typedef struct
 	AVFrame *decoded_frame;
 	AVPacket *output_packet;
 	void* resize_buffer;
-	int has_frame;
 
 	// frame state
 	frame_list_part_t cur_frame_part;
 	input_frame_t* cur_frame;
 	uint32_t skip_count;
+	int64_t target_pts;
 	bool_t first_time;
 	bool_t frame_started;
 	uint64_t dts;
-	uint32_t missing_frames;
 
 	// frame buffer state
 	uint32_t max_frame_size;
@@ -231,7 +235,8 @@ thumb_grabber_truncate_frames(
 	media_track_t* track, 
 	uint64_t requested_time, 
 	bool_t accurate,
-	uint32_t* skip_count)
+	uint32_t* skip_count,
+	int64_t* target_pts)
 {
 	frame_list_part_t* last_key_frame_part = NULL;
 	frame_list_part_t* min_part = NULL;
@@ -241,9 +246,11 @@ thumb_grabber_truncate_frames(
 	input_frame_t* last_frame;
 	vod_status_t rc;
 	uint64_t dts = track->clip_start_time + track->first_frame_time_offset;
+	uint64_t last_key_frame_dts = 0;
 	uint64_t pts;
 	uint64_t cur_diff;
 	uint64_t min_diff = ULLONG_MAX;
+	int64_t min_target_pts = 0;
 	uint32_t last_key_frame_index = 0;
 	uint32_t min_index = 0;
 	uint32_t index;
@@ -280,6 +287,7 @@ thumb_grabber_truncate_frames(
 			last_key_frame_index = index;
 			last_key_frame = cur_frame;
 			last_key_frame_part = part;
+			last_key_frame_dts = dts;
 		}
 
 		// find the closest frame
@@ -292,6 +300,10 @@ thumb_grabber_truncate_frames(
 			min_index = index - last_key_frame_index;
 			min_diff = cur_diff;
 			min_part = last_key_frame_part;
+
+			// the decoder receives the key frame at dts 0, so make the target pts relative to
+			// the key frame. it must match the packet pts computed in thumb_grabber_decode_frame
+			min_target_pts = (int64_t)(dts + cur_frame->pts_delay) - (int64_t)last_key_frame_dts;
 
 			rc = min_part->frames_source->skip_frames(
 				min_part->frames_source_context,
@@ -319,6 +331,7 @@ thumb_grabber_truncate_frames(
 	track->frames = *min_part;
 
 	*skip_count = min_index;
+	*target_pts = min_target_pts;
 
 	return VOD_OK;
 }
@@ -336,9 +349,8 @@ thumb_grabber_init_state(
 	thumb_grabber_state_t* state;
 	vod_pool_cleanup_t *cln;
 	vod_status_t rc;
-	uint32_t output_width;
-	uint32_t output_height;
 	uint32_t frame_index;
+	int64_t target_pts;
 
 	if (decoder_codec[track->media_info.codec_id] == NULL)
 	{
@@ -354,7 +366,7 @@ thumb_grabber_init_state(
 		return VOD_BAD_DATA;
 	}
 
-	rc = thumb_grabber_truncate_frames(request_context, track, request_params->segment_time, accurate, &frame_index);
+	rc = thumb_grabber_truncate_frames(request_context, track, request_params->segment_time, accurate, &frame_index, &target_pts);
 	if (rc != VOD_OK)
 	{
 		return rc;
@@ -396,54 +408,9 @@ thumb_grabber_init_state(
 		return rc;
 	}
 
-	if (request_params->width != 0)
-	{
-		output_width = request_params->width;
-		if (request_params->height != 0)
-		{
-			output_height = request_params->height;
-		}
-		else
-		{
-			output_height = ((uint64_t)track->media_info.u.video.height * request_params->width) / track->media_info.u.video.width;
-		}
-	}
-	else
-	{
-		if (request_params->height != 0)
-		{
-			output_width = ((uint64_t)track->media_info.u.video.width * request_params->height) / track->media_info.u.video.height;
-			output_height = request_params->height;
-		}
-		else
-		{
-			output_width = track->media_info.u.video.width;
-			output_height = track->media_info.u.video.height;
-		}
-	}
-
-	if (output_width <= 0 || output_height <= 0)
-	{
-		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
-			"thumb_grabber_init_state: output width/height is zero");
-		return VOD_BAD_REQUEST;
-	}
-
-	// TODO: postpone the initialization of the encoder to after a frame is decoded
-
-	rc = thumb_grabber_init_encoder(request_context, output_width, output_height, &state->encoder);
-	if (rc != VOD_OK)
-	{
-		return rc;
-	}
-
-	state->decoded_frame = av_frame_alloc();
-	if (state->decoded_frame == NULL)
-	{
-		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
-			"thumb_grabber_init_state: av_frame_alloc failed");
-		return VOD_ALLOC_FAILED;
-	}
+	// the encoder is initialized lazily, once a frame was decoded (the output size depends on the frame SAR)
+	state->requested_width = request_params->width;
+	state->requested_height = request_params->height;
 
 	state->output_packet = av_packet_alloc();
 	if (state->output_packet == NULL)
@@ -461,12 +428,11 @@ thumb_grabber_init_state(
 	state->max_frame_size = thumb_grabber_get_max_frame_size(track, frame_index + 1);
 	state->frame_buffer = NULL;
 	state->skip_count = frame_index;
+	state->target_pts = target_pts;
 	state->cur_frame_pos = 0;
 	state->first_time = TRUE;
 	state->frame_started = FALSE;
-	state->missing_frames = 0;
 	state->dts = 0;
-	state->has_frame = 0;
 
 	*result = state;
 
@@ -474,9 +440,57 @@ thumb_grabber_init_state(
 }
 
 static vod_status_t
-thumb_grabber_decode_flush(thumb_grabber_state_t* state)
+thumb_grabber_decode_frames(thumb_grabber_state_t* state)
 {
 	AVFrame* decoded_frame;
+	int avrc;
+
+	for (;;)
+	{
+		decoded_frame = av_frame_alloc();
+		if (decoded_frame == NULL)
+		{
+			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+				"thumb_grabber_decode_frames: av_frame_alloc failed");
+			return VOD_ALLOC_FAILED;
+		}
+
+		avrc = avcodec_receive_frame(state->decoder, decoded_frame);
+
+		// keep the decoded frame whose pts is closest to the target. the decoder emits frames in
+		// presentation order with a reorder delay, so with B-frames a fixed decode position can
+		// yield the wrong frame. matching on pts stays correct.
+		if (avrc >= 0 &&
+			(state->decoded_frame == NULL ||
+			vod_abs_diff(decoded_frame->pts, state->target_pts) <
+			vod_abs_diff(state->decoded_frame->pts, state->target_pts)))
+		{
+			av_frame_free(&state->decoded_frame);
+			state->decoded_frame = decoded_frame;
+			continue;
+		}
+
+		av_frame_free(&decoded_frame);
+
+		if (avrc == AVERROR_EOF || avrc == AVERROR(EAGAIN))
+		{
+			break;
+		}
+
+		if (avrc < 0)
+		{
+			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+				"thumb_grabber_decode_frames: avcodec_receive_frame failed %d", avrc);
+			return VOD_BAD_DATA;
+		}
+	}
+
+	return VOD_OK;
+}
+
+static vod_status_t
+thumb_grabber_decode_flush(thumb_grabber_state_t* state)
+{
 	int avrc;
 
 	avrc = avcodec_send_packet(state->decoder, NULL);
@@ -487,37 +501,7 @@ thumb_grabber_decode_flush(thumb_grabber_state_t* state)
 		return VOD_BAD_DATA;
 	}
 
-	for (; state->missing_frames > 0; state->missing_frames--)
-	{
-		decoded_frame = av_frame_alloc();
-		if (decoded_frame == NULL)
-		{
-			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-				"thumb_grabber_decode_flush: av_frame_alloc failed");
-			return VOD_ALLOC_FAILED;
-		}
-
-		avrc = avcodec_receive_frame(state->decoder, decoded_frame);
-		if (avrc == AVERROR_EOF)
-		{
-			av_frame_free(&decoded_frame);
-			break;
-		}
-
-		if (avrc < 0)
-		{
-			av_frame_free(&decoded_frame);
-			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-				"thumb_grabber_decode_flush: avcodec_decode_video2 failed %d", avrc);
-			return VOD_BAD_DATA;
-		}
-
-		av_frame_free(&state->decoded_frame);
-		state->decoded_frame = decoded_frame;
-		state->has_frame = 1;
-	}
-
-	return VOD_OK;
+	return thumb_grabber_decode_frames(state);
 }
 
 static vod_status_t 
@@ -543,17 +527,16 @@ thumb_grabber_decode_frame(thumb_grabber_state_t* state, u_char* buffer)
 	input_packet->duration = frame->duration;
 	input_packet->flags = frame->key_frame ? AV_PKT_FLAG_KEY : 0;
 	state->dts += frame->duration;
-	
-	av_frame_unref(state->decoded_frame);
-
-	state->has_frame = 0;
 
 	frame_end = buffer + frame->size;
 	vod_memcpy(original_pad, frame_end, sizeof(original_pad));
 	vod_memzero(frame_end, sizeof(original_pad));
 
 	avrc = avcodec_send_packet(state->decoder, input_packet);
+
+	vod_memcpy(frame_end, original_pad, sizeof(original_pad));
 	av_packet_free(&input_packet);
+
 	if (avrc < 0)
 	{
 		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
@@ -561,23 +544,67 @@ thumb_grabber_decode_frame(thumb_grabber_state_t* state, u_char* buffer)
 		return VOD_BAD_DATA;
 	}
 
-	avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
-	if (avrc == AVERROR(EAGAIN))
+	return thumb_grabber_decode_frames(state);
+}
+
+static vod_status_t
+thumb_grabber_get_output_size(thumb_grabber_state_t* state, int* width, int* height)
+{
+	int output_width;
+	int output_height;
+#if (VOD_HAVE_LIB_SW_SCALE)
+	AVRational aspect;
+	double aspect_d;
+	double display_width;
+	double display_height;
+
+	// use the bitstream sample aspect ratio (e.g. AVC/HEVC VUI), or default to square pixels
+	// TODO: also honor the container SAR (e.g. the pasp atom) as a fallback
+	aspect = state->decoded_frame->sample_aspect_ratio;
+	if (aspect.num <= 0 || aspect.den <= 0)
 	{
-		state->missing_frames++;
+		aspect.num = 1;
+		aspect.den = 1;
 	}
-	else if (avrc < 0)
+
+	aspect_d = (double)aspect.num / (double)aspect.den;
+	display_width = (double)state->decoded_frame->width * aspect_d;
+	display_height = (double)state->decoded_frame->height;
+
+	if (state->requested_width != 0 && state->requested_height != 0)
 	{
-		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"thumb_grabber_decode_frame: avcodec_receive_frame failed %d", avrc);
-		return VOD_BAD_DATA;
+		output_width = state->requested_width;
+		output_height = state->requested_height;
+	}
+	else if (state->requested_width != 0)
+	{
+		output_width = state->requested_width;
+		output_height = lround(state->requested_width * display_height / display_width);
+	}
+	else if (state->requested_height != 0)
+	{
+		output_width = lround(state->requested_height * display_width / display_height);
+		output_height = state->requested_height;
 	}
 	else
 	{
-		state->has_frame = 1;
+		output_width = lround(display_width);
+		output_height = state->decoded_frame->height;
+	}
+#else
+	output_width = state->decoded_frame->width;
+	output_height = state->decoded_frame->height;
+#endif // VOD_HAVE_LIB_SW_SCALE
+
+	if (output_width <= 0 || output_height <= 0)
+	{
+		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+			"thumb_grabber_get_output_size: output width/height is zero");
+		return VOD_BAD_REQUEST;
 	}
 
-	vod_memcpy(frame_end, original_pad, sizeof(original_pad));
+	*width = output_width;
+	*height = output_height;
 
 	return VOD_OK;
 }
@@ -603,7 +630,8 @@ thumb_grabber_resize_frame(thumb_grabber_state_t* state)
 
 	output_frame->width = state->encoder->width;
 	output_frame->height = state->encoder->height;
-	output_frame->format = AV_PIX_FMT_YUV420P;
+	// TODO: migrate to AV_PIX_FMT_YUV420P + AVCOL_RANGE_JPEG
+	output_frame->format = AV_PIX_FMT_YUVJ420P;
 
 	sws_ctx = sws_getContext(
 		input_frame->width, input_frame->height, input_frame->format,
@@ -652,21 +680,29 @@ thumb_grabber_write_frame(thumb_grabber_state_t* state)
 {
 	vod_status_t rc;
 	int avrc;
+	int width;
+	int height;
 
-	if (state->missing_frames > 0)
-	{
-		rc = thumb_grabber_decode_flush(state);
-		if (rc != VOD_OK)
-		{
-			return rc;
-		}
-	}
-
-	if (!state->has_frame)
+	if (state->decoded_frame == NULL)
 	{
 		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
 			"thumb_grabber_write_frame: no frames were decoded");
 		return VOD_UNEXPECTED;
+	}
+
+	if (state->encoder == NULL)
+	{
+		rc = thumb_grabber_get_output_size(state, &width, &height);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
+
+		rc = thumb_grabber_init_encoder(state->request_context, width, height, &state->encoder);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
 	}
 
 #if (VOD_HAVE_LIB_SW_SCALE)
@@ -802,9 +838,16 @@ thumb_grabber_process(void* context)
 			return rc;
 		}
 
-		// if the target frame was reached, write it
+		// reached the target frame: flush the decoder so the closest-pts pick sees every frame
+		// still held in the reorder buffer, then write the result
 		if (state->skip_count <= 0)
 		{
+			rc = thumb_grabber_decode_flush(state);
+			if (rc != VOD_OK)
+			{
+				return rc;
+			}
+
 			return thumb_grabber_write_frame(state);
 		}
 
